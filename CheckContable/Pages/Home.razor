@@ -1,0 +1,202 @@
+﻿@page "/"
+@using System.IO
+@using System.Data
+@using ExcelDataReader
+@using System.Text
+@inject IJSRuntime JS
+@inject IToastService toastService
+
+<div class="card p-3 shadow-sm">
+    <h5>1. Carga de Archivo</h5>
+    <div class="mb-3">
+        <label class="form-check">
+            <input type="checkbox" class="form-check-input" @bind="tieneCabecera" />
+            La primera fila contiene los nombres de las columnas
+        </label>
+    </div>
+
+    <div class="input-group mb-3">
+        <InputFile OnChange="HandleFileSelected" class="form-control" accept=".xlsx, .xls" />
+    </div>
+
+    @if (nombresDeColumnas.Any())
+    {
+        <hr />
+        <h5>2. Configuración de Mapeo</h5>
+        <div class="row g-3 align-items-center">
+            <div class="col-auto">
+                <label for="selectCuit" class="col-form-label">Columna del CUIT:</label>
+            </div>
+            <div class="col-auto">
+                <select id="selectCuit" class="form-select" @bind="columnaCuitSeleccionada">
+                    <option value="">-- Seleccione una columna --</option>
+                    @foreach (var col in nombresDeColumnas)
+                    {
+                        <option value="@col">@col</option>
+                    }
+                </select>
+            </div>
+            <div class="col-auto">
+                <button class="btn btn-success" @onclick="ProcesarArchivo" disabled="@string.IsNullOrEmpty(columnaCuitSeleccionada)">
+                    Validar CUITs
+                </button>
+            </div>
+        </div>
+    }
+</div>
+
+
+@if (dataTable != null)
+{
+    <table class="table">
+        <thead>
+            <tr>
+                @foreach (DataColumn col in dataTable.Columns)
+                {
+                    <th>@col.ColumnName</th>
+                }
+            </tr>
+        </thead>
+        <tbody>
+
+            @for (int i = 0; i < dataTable.Rows.Count; i++)
+            {
+                <tr>
+                    @foreach (DataColumn col in dataTable.Columns)
+                    {
+                        <td>
+                            <span style="color: @(celdaOk[$"{i}-{col.ColumnName}"] ? "inherit" : "red")">
+                                @dataTable.Rows[i][col.ColumnName]
+                            </span>
+                        </td>
+                    }
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private DataTable? dataTable;
+    private bool tieneCabecera;
+    private List<string> nombresDeColumnas = new();
+    private string columnaCuitSeleccionada = "";
+    private List<Cuit> cuits = new List<Cuit>();
+    private Dictionary<string, bool> celdaOk = new();
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+        using var ms = new MemoryStream();
+
+        // Necesario para leer archivos .xls y .xlsx con codificación correcta
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
+        await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(ms);
+        ms.Position = 0;
+
+        using (var reader = ExcelReaderFactory.CreateReader(ms))
+        {
+            // Leer todo el archivo y convertir a DataSet
+            var result = reader.AsDataSet(new ExcelDataSetConfiguration()
+            {
+                ConfigureDataTable = (_) => new ExcelDataTableConfiguration()
+                {
+                    UseHeaderRow = tieneCabecera // Usar la primera fila como cabecera
+                }
+            });
+
+            // Tomar la primera hoja
+            dataTable = result.Tables[0];
+
+            // Extraer nombres de columnas para el <select>
+            nombresDeColumnas = dataTable.Columns.Cast<DataColumn>()
+                                                  .Select(x => x.ColumnName)
+                                                  .ToList();
+
+
+            for (int i = 0; i < dataTable.Rows.Count; i++)
+            {
+                foreach (DataColumn col in dataTable.Columns)
+                {
+                    celdaOk[$"{i}-{col.ColumnName}"] = true;
+                }
+            }
+        }
+
+    }
+
+    private void ProcesarArchivo()
+    {
+        int errores = 0;
+        
+        for (int i = 0; i < dataTable.Rows.Count; i++)
+        {
+            foreach (DataColumn col in dataTable.Columns)
+            {
+                if (col.ColumnName == columnaCuitSeleccionada)
+                {
+                    string? CUIT = dataTable.Rows[i][columnaCuitSeleccionada].ToString();
+                    CUIT = SoloNumeros(CUIT);
+                    bool valido = ValidarCuit(CUIT);
+                    celdaOk[$"{i}-{col.ColumnName}"] = valido;
+                    if (!valido) errores++;
+                }
+            }
+        }
+
+        toastService.ShowWarning($"Se encontraron {errores} CUITs con errores.");
+    }
+
+    public string SoloNumeros(string cuit)
+    {
+        if (string.IsNullOrEmpty(cuit)) return string.Empty;
+
+        // Filtra y mantiene solo los caracteres que son dígitos
+        return new string(cuit.Where(char.IsDigit).ToArray());
+    }
+
+    public static bool ValidarCuit(string cuit)
+    {
+        if (string.IsNullOrEmpty(cuit)) return false;
+
+        // 1. Quitamos cualquier caracter que no sea un número
+        string cuitLimpio = new string(cuit.Where(char.IsDigit).ToArray());
+
+        // 2. El CUIT debe tener exactamente 11 dígitos
+        if (cuitLimpio.Length != 11) return false;
+
+        // 3. Verificamos prefijos comunes (20, 23, 24, 27, 30, 33, 34)
+        // Aunque no es obligatorio para el cálculo matemático, ayuda a filtrar errores groseros
+        string prefijo = cuitLimpio.Substring(0, 2);
+        string[] prefijosValidos = { "20", "23", "24", "27", "30", "33", "34" };
+        if (!prefijosValidos.Contains(prefijo)) return false;
+
+        // 4. Algoritmo de Módulo 11
+        int[] factores = { 5, 4, 3, 2, 7, 6, 5, 4, 3, 2 };
+        int suma = 0;
+
+        for (int i = 0; i < 10; i++)
+        {
+            suma += (int.Parse(cuitLimpio[i].ToString()) * factores[i]);
+        }
+
+        int resto = suma % 11;
+        int digitoVerificadorCalculado = 11 - resto;
+
+        if (digitoVerificadorCalculado == 11) digitoVerificadorCalculado = 0;
+        if (digitoVerificadorCalculado == 10)
+        {
+            // Caso especial: Si el resultado es 10, AFIP suele cambiar el prefijo
+            // y el dígito suele terminar siendo otro, pero para validación
+            // matemática directa, un CUIT que resulta en 10 no debería existir
+            // sin haber ajustado el prefijo antes.
+            return false;
+        }
+
+        int digitoVerificadorReal = int.Parse(cuitLimpio[10].ToString());
+
+        return digitoVerificadorCalculado == digitoVerificadorReal;
+    }
+}
